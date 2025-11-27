@@ -1,0 +1,363 @@
+{
+  "name": "kahaniwaala-backend",
+  "version": "0.1.0",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js"
+  },
+  "dependencies": {
+    "aws-sdk": "^2.1363.0",
+    "body-parser": "^1.20.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.0",
+    "mongoose": "^7.5.0",
+    "multer": "^1.4.5-lts.1"
+  }
+}
+const express = require('express');
+const mongoose = require('mongoose');
+const dotenv = require('dotenv');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+
+dotenv.config();
+const app = express();
+app.use(cors());
+app.use(bodyParser.json());
+
+const storiesRouter = require('./routes/stories');
+const creatorsRouter = require('./routes/creators');
+const uploadsRouter = require('./routes/uploads');
+
+app.use('/api/stories', storiesRouter);
+app.use('/api/creators', creatorsRouter);
+app.use('/api/uploads', uploadsRouter);
+
+const PORT = process.env.PORT || 4000;
+const MONGO_URI = process.env.MONGO_URI;
+
+mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+  .then(() => {
+    console.log('Connected to MongoDB');
+    app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+  })
+  .catch(err => {
+    console.error('MongoDB connection error:', err);
+  });
+  const mongoose = require('mongoose');
+
+const CreatorApplicationSchema = new mongoose.Schema({
+  bio: String,
+  samples: [String], // URLs to sample audio
+  status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
+  appliedAt: { type: Date, default: Date.now }
+});
+
+const UserSchema = new mongoose.Schema({
+  username: { type: String, required: true, unique: true },
+  email: { type: String, required: true, unique: true },
+  passwordHash: { type: String }, // store hashed password
+  role: { type: String, enum: ['user', 'creator', 'admin'], default: 'user' },
+  creatorApplication: CreatorApplicationSchema
+}, { timestamps: true });
+
+module.exports = mongoose.model('User', UserSchema);
+const mongoose = require('mongoose');
+
+const CommentSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  username: String,
+  text: String,
+  createdAt: { type: Date, default: Date.now }
+});
+
+const StorySchema = new mongoose.Schema({
+  title: String,
+  description: String,
+  audioUrl: String, // S3 URL
+  durationSec: Number,
+  creatorId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  likes: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  comments: [CommentSchema],
+  tags: [String],
+  published: { type: Boolean, default: true },
+  createdAt: { type: Date, default: Date.now }
+});
+
+module.exports = mongoose.model('Story', StorySchema);
+const jwt = require('jsonwebtoken');
+const User = require('../models/User');
+
+const authRequired = async (req, res, next) => {
+  // Expect Authorization: Bearer <token>
+  const header = req.headers.authorization;
+  if (!header) return res.status(401).json({ message: 'No authorization header' });
+  const token = header.split(' ')[1];
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await User.findById(payload.id).select('-passwordHash');
+    if (!user) return res.status(401).json({ message: 'Invalid token' });
+    req.user = user;
+    next();
+  } catch (err) {
+    return res.status(401).json({ message: 'Invalid token' });
+  }
+};
+
+const requireCreator = (req, res, next) => {
+  if (!req.user) return res.status(401).json({ message: 'Not authenticated' });
+  if (req.user.role !== 'creator' && req.user.role !== 'admin') {
+    return res.status(403).json({ message: 'Creator role required' });
+  }
+  next();
+};
+
+module.exports = { authRequired, requireCreator };
+const express = require('express');
+const Story = require('../models/Story');
+const { authRequired, requireCreator } = require('../middleware/auth');
+const router = express.Router();
+
+// GET /api/stories - list with basic pagination
+router.get('/', async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page || '1'));
+  const limit = Math.min(50, parseInt(req.query.limit || '10'));
+  const skip = (page - 1) * limit;
+  const stories = await Story.find({ published: true }).sort({ createdAt: -1 }).skip(skip).limit(limit).populate('creatorId', 'username');
+  res.json({ data: stories });
+});
+
+// GET /api/stories/:id
+router.get('/:id', async (req, res) => {
+  const story = await Story.findById(req.params.id).populate('creatorId', 'username');
+  if (!story) return res.status(404).json({ message: 'Not found' });
+  res.json(story);
+});
+
+// POST /api/stories - create story (creator only)
+router.post('/', authRequired, requireCreator, async (req, res) => {
+  const { title, description, audioUrl, durationSec, tags } = req.body;
+  const story = new Story({
+    title, description, audioUrl, durationSec,
+    creatorId: req.user._id,
+    tags
+  });
+  await story.save();
+  res.status(201).json(story);
+});
+
+// POST /api/stories/:id/like - toggle like
+router.post('/:id/like', authRequired, async (req, res) => {
+  const story = await Story.findById(req.params.id);
+  if (!story) return res.status(404).json({ message: 'Not found' });
+  const userId = req.user._id;
+  const idx = story.likes.findIndex(id => id.equals(userId));
+  if (idx === -1) {
+    story.likes.push(userId);
+  } else {
+    story.likes.splice(idx, 1);
+  }
+  await story.save();
+  res.json({ likesCount: story.likes.length, liked: idx === -1 });
+});
+
+// POST /api/stories/:id/comment
+router.post('/:id/comment', authRequired, async (req, res) => {
+  const { text } = req.body;
+  if (!text || !text.trim()) return res.status(400).json({ message: 'Comment text required' });
+  const story = await Story.findById(req.params.id);
+  if (!story) return res.status(404).json({ message: 'Not found' });
+  story.comments.push({ userId: req.user._id, username: req.user.username, text });
+  await story.save();
+  res.status(201).json({ comments: story.comments });
+});
+
+module.exports = router;
+const express = require('express');
+const User = require('../models/User');
+const { authRequired } = require('../middleware/auth');
+const router = express.Router();
+
+// POST /api/creators/apply
+// body: { bio, samples: [url1, url2] }
+router.post('/apply', authRequired, async (req, res) => {
+  const { bio, samples } = req.body;
+  const user = await User.findById(req.user._id);
+  if (!user) return res.status(404).json({ message: 'User not found' });
+
+  // If already creator or pending
+  if (user.role === 'creator') return res.status(400).json({ message: 'Already a creator' });
+  if (user.creatorApplication && user.creatorApplication.status === 'pending') {
+    return res.status(400).json({ message: 'Application pending' });
+  }
+
+  user.creatorApplication = { bio, samples, status: 'pending', appliedAt: new Date() };
+  await user.save();
+
+  // TODO: notify admins for review (email, dashboard)
+  res.status(201).json({ message: 'Application submitted', application: user.creatorApplication });
+});
+
+// NOTE: Admin endpoints to approve/reject not included here (add for production)
+module.exports = router;
+const express = require('express');
+const AWS = require('aws-sdk');
+const { authRequired, requireCreator } = require('../middleware/auth');
+const router = express.Router();
+
+AWS.config.update({ region: process.env.AWS_REGION });
+
+const s3 = new AWS.S3();
+
+// POST /api/uploads/presign
+// body: { filename, contentType }
+// returns { url, key, uploadUrl }
+router.post('/presign', authRequired, requireCreator, async (req, res) => {
+  const { filename, contentType } = req.body;
+  if (!filename || !contentType) return res.status(400).json({ message: 'filename and contentType required' });
+
+  const key = `stories/${req.user._id}/${Date.now()}-${filename}`;
+  const params = {
+    Bucket: process.env.S3_BUCKET,
+    Key: key,
+    Expires: 60 * 5,
+    ContentType: contentType,
+    ACL: 'public-read' // consider private + CloudFront if needed
+  };
+
+  try {
+    const uploadUrl = await s3.getSignedUrlPromise('putObject', params);
+    const publicUrl = `https://${process.env.S3_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${encodeURIComponent(key)}`;
+    res.json({ uploadUrl, key, publicUrl });
+  } catch (err) {
+    console.error('Presign error', err);
+    res.status(500).json({ message: 'Failed to get presigned url' });
+  }
+});
+
+module.exports = router;
+{
+  "name": "kahaniwaala-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "axios": "^1.4.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-scripts": "5.0.1"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build"
+  }
+}
+import React from 'react';
+
+export default function StoryPlayer({ story }) {
+  if (!story) return null;
+  return (
+    <div className="story-player">
+      <h3>{story.title}</h3>
+      <p>By: {story.creatorId?.username || 'Unknown'}</p>
+      <audio controls preload="metadata" src={story.audioUrl}>
+        Your browser does not support the audio element.
+      </audio>
+      <p>{story.description}</p>
+    </div>
+  );
+}
+import React, { useState } from 'react';
+import axios from 'axios';
+
+// Props: onUploaded(storyMeta)
+export default function UploadStory({ apiBase = '/api' , onUploaded }) {
+  const [file, setFile] = useState(null);
+  const [title, setTitle] = useState('');
+  const [description, setDescription] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!file) return alert('Select audio file');
+    setLoading(true);
+    try {
+      // 1. Get presigned URL
+      const token = localStorage.getItem('token'); // adapt to your auth
+      const res = await axios.post(`${apiBase}/uploads/presign`, {
+        filename: file.name,
+        contentType: file.type
+      }, { headers: { Authorization: `Bearer ${token}` } });
+      const { uploadUrl, publicUrl } = res.data;
+
+      // 2. Upload directly to S3
+      await axios.put(uploadUrl, file, { headers: { 'Content-Type': file.type } });
+
+      // 3. Create story metadata in backend
+      const createRes = await axios.post(`${apiBase}/stories`, {
+        title, description, audioUrl: publicUrl, durationSec: 0, tags: []
+      }, { headers: { Authorization: `Bearer ${token}` } });
+
+      setFile(null);
+      setTitle('');
+      setDescription('');
+      onUploaded && onUploaded(createRes.data);
+      alert('Uploaded and story created');
+    } catch (err) {
+      console.error(err);
+      alert('Upload failed');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <h3>Upload a story (creators only)</h3>
+      <input required value={title} onChange={e => setTitle(e.target.value)} placeholder="Title" />
+      <textarea value={description} onChange={e => setDescription(e.target.value)} placeholder="Description" />
+      <input accept="audio/*" type="file" onChange={e => setFile(e.target.files[0])} />
+      <button type="submit" disabled={loading}>{loading ? 'Uploading...' : 'Upload'}</button>
+    </form>
+  );
+}
+import React, { useState } from 'react';
+import axios from 'axios';
+
+export default function CreatorApplyButton({ apiBase = '/api' }) {
+  const [open, setOpen] = useState(false);
+  const [bio, setBio] = useState('');
+  const [samples, setSamples] = useState('');
+
+  const submit = async () => {
+    const token = localStorage.getItem('token');
+    try {
+      const res = await axios.post(`${apiBase}/creators/apply`, {
+        bio,
+        samples: samples.split(',').map(s => s.trim()).filter(Boolean)
+      }, { headers: { Authorization: `Bearer ${token}` } });
+      alert('Application submitted');
+      setOpen(false);
+    } catch (err) {
+      console.error(err);
+      alert('Failed to submit application');
+    }
+  };
+
+  return (
+    <div>
+      <button onClick={() => setOpen(true)}>Apply to be a Creator</button>
+      {open && (
+        <div className="modal">
+          <h3>Creator Application</h3>
+          <textarea value={bio} onChange={e => setBio(e.target.value)} placeholder="Tell us about your work" />
+          <input value={samples} onChange={e => setSamples(e.target.value)} placeholder="Sample audio URLs, comma-separated" />
+          <button onClick={submit}>Submit Application</button>
+          <button onClick={() => setOpen(false)}>Cancel</button>
+        </div>
+      )}
+    </div>
+  );
+}
